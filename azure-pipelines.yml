@@ -97,7 +97,7 @@ steps:
         # Enrich body with Subject
         $maesterbody.message.subject = $env:EmailSUBJECT
         
-        # Send the report to destinantion
+        # Send the report to destination
         Send-MgUserMail -UserId $env:EmailSENDER -BodyParameter $maesterbody
 
     env:
