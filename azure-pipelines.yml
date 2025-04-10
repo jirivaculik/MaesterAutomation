@@ -1,0 +1,113 @@
+# Maester Daily Tests
+
+trigger:
+  - main
+
+schedules:
+  - cron: '0 0 * * *'
+    displayName: Daily midnight build
+    branches:
+      include:
+        - main
+
+pool:
+  vmImage: windows-latest
+
+steps:
+  - task: AzurePowerShell@5
+    displayName: "Run Maester"
+    inputs:
+      azureSubscription: "MaesterServiceConnection"
+      pwsh: true
+      azurePowerShellVersion: LatestVersion
+      ScriptType: InlineScript
+      Inline: |
+        # Connect to Microsoft Graph
+        $accessToken = (Get-AzAccessToken -ResourceTypeName MSGraph).Token | ConvertTo-SecureString -AsPlainText -Force
+        Connect-MgGraph $accessToken
+
+        # Install Maester
+        Install-Module Maester -Force
+
+        # Convert the certificate password to a secure string with environment variable PS_SecCERTPASSWORD
+        $SecCERTPASSWORD = ConvertTo-SecureString -AsPlainText $env:PS_SecCERTPASSWORD -Force
+
+        # Install ExchangeOnlineManagement module for Exchange Online and Security & Compliance Center
+        Install-Module -Name ExchangeOnlineManagement -Scope CurrentUser -Force
+        Import-Module ExchangeOnlineManagement
+       
+        # Connect to Exchange Online
+        Connect-ExchangeOnline -CertificateFilePath $(System.DefaultWorkingDirectory)$env:CERTPATH  -CertificatePassword $SecCERTPASSWORD -AppId $env:APPID -Organization $env:ORGANIZATION
+        
+        # Connect to Security & Compliance Center with Exchange module
+        Connect-IPPSSession -CertificateFilePath $(System.DefaultWorkingDirectory)$env:CERTPATH  -CertificatePassword $SecCERTPASSWORD -AppId $env:APPID -Organization $env:ORGANIZATION
+
+        # Install MicrosoftTeams module for Teams
+        Install-Module -Name MicrosoftTeams -Scope CurrentUser -Force
+        Import-Module MicrosoftTeams
+
+        # Connect to Teams
+        $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2("$(System.DefaultWorkingDirectory)$env:CERTPATH", $SecCERTPASSWORD)
+        Connect-MicrosoftTeams -Certificate $cert -ApplicationId $env:APPID -TenantId $env:TENANTID
+        
+        # Install Azure modules
+        Install-Module Az.Accounts -Force
+        Install-Module Az.Resources -Force
+
+        # Connect to Azure
+        Connect-AzAccount -ServicePrincipal -ApplicationId $env:APPID -Tenant $env:TENANTID -CertificatePath $(System.DefaultWorkingDirectory)$env:CERTPATH -CertificatePassword $SecCERTPASSWORD
+
+        # Configure test results
+        $PesterConfiguration = New-PesterConfiguration
+        $PesterConfiguration.TestResult.Enabled = $true
+        $PesterConfiguration.TestResult.OutputPath = '$(System.DefaultWorkingDirectory)/test-results.xml'
+
+        # Run Maester tests and get the results of the Maester tests using -PassThru
+        $results = Invoke-Maester -Path $(System.DefaultWorkingDirectory)$env:TestSCOPE -PesterConfiguration $PesterConfiguration -OutputFolder '$(System.DefaultWorkingDirectory)' -PassThru
+
+        
+        # Load file for name of attachment
+        $htmlFilePath = Get-ChildItem -Path .\TestResults-*.html | Select-Object -Last 1 -ExpandProperty FullName
+        # Load file content
+        $htmlContent = Get-Content -Path .\TestResults-*.html -Raw
+        # Text encoding
+        $htmlBytes = [System.Text.Encoding]::UTF8.GetBytes($htmlContent)
+        # Convert to Base64
+        $base64Content = [System.Convert]::ToBase64String($htmlBytes)
+
+        # Load full converted content to email attachment format
+        $attachment = @(
+        @{
+          "@odata.type"= "#microsoft.graph.fileAttachment"
+          Name = [System.IO.Path]::GetFileName($htmlFilePath)
+          contentType = "text/html"
+          contentBytes = $base64Content
+        }
+        )
+        
+        # Add ResultUri to email body
+        $testResultsUri = "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+        # Get original Maester email body
+        $maesterbody = Send-MtMail $results -CreateBodyOnly -Recipient $env:EmailRECIPIENT  -TestResultsUri $testResultsUri
+
+        # Enrich body with HTML attachment
+        $maesterbody.message += @{
+            attachments = $attachment
+        }
+        # Enrich body with Subject
+        $maesterbody.message.subject = $env:EmailSUBJECT
+        
+        # Send the report to destinantion
+        Send-MgUserMail -UserId $env:EmailSENDER -BodyParameter $maesterbody
+
+    env:
+      PS_SecCERTPASSWORD: $(SecCERTPASSWORD)
+  - publish: $(System.DefaultWorkingDirectory)
+    displayName: Publish Maester Html Report
+    artifact: TestResults
+  - task: PublishTestResults@2
+    displayName: Publish Pester Test Results
+    inputs:
+      testResultsFormat: "NUnit"
+      testResultsFiles: "**/test-results.xml"
+      failTaskOnFailedTests: false
